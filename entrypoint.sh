@@ -44,8 +44,10 @@ WATCH_PID=$!
 
 echo "[entrypoint] all started: serve=$SERVE_PID bot=$BOT_PID watch=$WATCH_PID"
 
-# если любой процесс упадёт — контейнер должен упасть, Render перезапустит сам
-wait -n $SERVE_PID $BOT_PID $WATCH_PID
+# если любой процесс упадёт — контейнер должен упасть, Render перезапустит сам.
+# `|| true` обязателен: с `set -e` скрипт умирал ПРЯМО НА `wait -n`, если оно
+# вернуло ненулевой код — вся диагностика ниже никогда не успевала выполниться.
+wait -n $SERVE_PID $BOT_PID $WATCH_PID || true
 echo "[entrypoint] one of the processes exited, shutting down. Logs:"
 for p in "$SERVE_PID:serve:/app/logs_serve.log" "$BOT_PID:bot:/app/logs_bot.log" "$WATCH_PID:watch:/app/logs_watch.log"; do
   pid="${p%%:*}"; rest="${p#*:}"; name="${rest%%:*}"; file="${rest#*:}"
