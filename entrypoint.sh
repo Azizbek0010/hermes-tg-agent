@@ -19,7 +19,7 @@ opencode serve --port "$OC_PORT" --hostname 127.0.0.1 < /dev/null > /app/logs_se
 SERVE_PID=$!
 
 for i in $(seq 1 30); do
-  if curl -s "http://127.0.0.1:$OC_PORT/doc" > /dev/null 2>&1; then
+  if curl -s --max-time 3 "http://127.0.0.1:$OC_PORT/doc" > /dev/null 2>&1; then
     echo "[entrypoint] opencode serve is up after ${i}0s"
     break
   fi
