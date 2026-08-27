@@ -101,6 +101,17 @@ def notify_owner(text: str):
     )
 
 
+def reply_in_group_as_bot(reply_to_message_id: int, text: str):
+    """Ответ в группу идёт от бота Hermes (Bot API), НЕ от личного аккаунта
+    владельца через Telethon — Telethon тут только читает/анализирует."""
+    r = requests.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        json={"chat_id": AGENTS_GROUP_ID, "text": text, "reply_to_message_id": reply_to_message_id},
+        timeout=15,
+    )
+    r.raise_for_status()
+
+
 PROJECTS = ["LevelUp Academy", "Greenhouse", "Ishchi.uz", "AI Camera Pilot", "Misc"]
 
 PROMPT_TEMPLATE = """В группе Telegram "Agents" появилось новое сообщение от человека (не от бота).
@@ -115,17 +126,35 @@ PROMPT_TEMPLATE = """В группе Telegram "Agents" появилось нов
 Ответь СТРОГО в этом формате, каждое поле на новой строке, без лишнего текста:
 
 SILENCE: да|нет
-(да — если сообщение адресовано явно ДРУГОМУ человеку по имени, не
-Азизбеку/Карису, ИЛИ это обычный трёп без ценной информации и не задача)
+(да — ТОЛЬКО если сообщение явно адресовано ДРУГОМУ человеку по имени, не
+Азизбеку/Карису, ИЛИ это обычный трёп без ценной информации, не вопрос и не
+задача. Прямой вопрос агенту/Карису типа "работаешь?", "ты здесь?", "ответь"
+— это НЕ трёп, SILENCE: нет)
 
 TASK: да|нет
-(да — только если это назначение задачи Азизбеку/Карису — один и тот же
-человек, владелец)
+(да — ТОЛЬКО если это конкретное, чёткое поручение именно Азизбеку/Карису
+персонально, с понятным результатом, который реально нужно потом сделать
+руками. НЕ task: общие предложения группе («давайте пообщаемся с ботами»,
+«кто-нибудь свяжитесь с X»), общие призывы ко всем участникам, философские
+рассуждения, обсуждение проекта в целом, вопросы без конкретного поручения.
+Тест: если бы Азизбек это прочитал через неделю в бэклоге, было бы понятно,
+что именно и зачем делать? Если нет — TASK: нет. Азизбек и Карис — один
+и тот же человек, владелец.)
 
 PROJECT: одно из {projects}
 (выбери, к какому проекту относится задача; если неясно — Misc)
 
 TASK_TEXT: <короткий текст задачи по-русски для пункта списка, или пусто>
+
+REPLY_IN_GROUP: да|нет
+(да — если это прямой вопрос агенту/Карису, просьба подтвердить присутствие,
+или любой вопрос, на который ты МОЖЕШЬ содержательно ответить сам, не имея
+инструментов, — просто из общих знаний. Отвечай сам, пробуй, не отказывайся
+за компанию с SILENCE. нет — если это задача (тогда просто фиксация в файл
+достаточна) или если вопрос требует реального действия, которого у тебя нет)
+
+REPLY_TEXT: <сам ответ, ТЕМ ЖЕ языком, что и вопрос (узбекский — на
+узбекском). Коротко и по делу, как в обычном чате. Пусто, если REPLY_IN_GROUP: нет>
 
 SUMMARY: <связное сообщение владельцу на русском: кто написал, о чём (с
 переводом, если было на узбекском); не пиши это поле если SILENCE: да>
@@ -133,7 +162,10 @@ SUMMARY: <связное сообщение владельцу на русско
 
 
 def parse_verdict(raw: str) -> dict:
-    result = {"silence": False, "task": False, "project": "Misc", "task_text": "", "summary": ""}
+    result = {
+        "silence": False, "task": False, "project": "Misc", "task_text": "",
+        "reply_in_group": False, "reply_text": "", "summary": "",
+    }
     for line in raw.splitlines():
         line = line.strip()
         if line.upper().startswith("SILENCE:"):
@@ -145,6 +177,10 @@ def parse_verdict(raw: str) -> dict:
             result["project"] = val if val in PROJECTS else "Misc"
         elif line.upper().startswith("TASK_TEXT:"):
             result["task_text"] = line.split(":", 1)[1].strip()
+        elif line.upper().startswith("REPLY_IN_GROUP:"):
+            result["reply_in_group"] = "да" in line.lower()
+        elif line.upper().startswith("REPLY_TEXT:"):
+            result["reply_text"] = line.split(":", 1)[1].strip()
         elif line.upper().startswith("SUMMARY:"):
             result["summary"] = line.split(":", 1)[1].strip()
     return result
@@ -168,10 +204,13 @@ def append_task(project: str, task_text: str):
 
 async def handle_message(event):
     msg = event.message
+    print(f"[watch] event fired: chat_id={event.chat_id} msg_id={msg.id} text={(msg.message or '')[:60]!r}", flush=True)
     sender = await event.get_sender()
     if sender is None:
+        print("[watch] sender is None — игнор", flush=True)
         return
     if getattr(sender, "bot", False):
+        print(f"[watch] sender is a bot ({getattr(sender,'username',None)}) — игнор", flush=True)
         return  # чужие боты — игнор, иначе тонем в их переписке
     text = msg.message or ""
     file_note = ""
@@ -190,12 +229,16 @@ async def handle_message(event):
     prompt = PROMPT_TEMPLATE.format(
         sender=sender_name, text=(text or "(пусто, только файл)") + file_note, projects=PROJECTS
     )
+    print(f"[watch] asking opencode about message from {sender_name}...", flush=True)
     try:
         raw = ask_opencode(prompt)
     except Exception as e:
+        print(f"[watch] ask_opencode FAILED: {e}", flush=True)
         notify_owner(f"⚠️ agents_watch: ошибка анализа сообщения от {sender_name}: {e}")
         return
+    print(f"[watch] verdict raw: {raw[:400]!r}", flush=True)
     v = parse_verdict(raw)
+    print(f"[watch] parsed: silence={v['silence']} task={v['task']} reply_in_group={v['reply_in_group']}", flush=True)
     if v["silence"]:
         return
     if v["task"] and v["task_text"]:
@@ -203,9 +246,15 @@ async def handle_message(event):
             append_task(v["project"], v["task_text"])
         except Exception as e:
             notify_owner(f"⚠️ agents_watch: не смог записать задачу в Global Task.md: {e}")
+    if v["reply_in_group"] and v["reply_text"]:
+        try:
+            reply_in_group_as_bot(msg.id, v["reply_text"])
+        except Exception as e:
+            notify_owner(f"⚠️ agents_watch: не смог ответить {sender_name} в группе (бот Hermes): {e}")
     summary = v["summary"] or raw
     task_note = f"\n\n✅ Добавлено в Global Task.md → {v['project']}: {v['task_text']}" if v["task"] and v["task_text"] else ""
-    notify_owner(f"👀 Agents / {sender_name}:\n\n{summary}{task_note}")
+    reply_note = f"\n\n💬 Ответил в группе: {v['reply_text']}" if v["reply_in_group"] and v["reply_text"] else ""
+    notify_owner(f"👀 Agents / {sender_name}:\n\n{summary}{task_note}{reply_note}")
 
 
 async def main():
