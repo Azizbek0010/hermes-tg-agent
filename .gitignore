@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+logs/
+*.log
+*.pid
+sessions.json
+owner.json
+agents_watch_session.txt
+agents_watch_files/
+.env

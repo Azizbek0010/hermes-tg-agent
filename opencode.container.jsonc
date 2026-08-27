@@ -1,0 +1,68 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "bash": {
+      "rm -rf*": "deny",
+      "rm -rf /*": "deny",
+      "*format*": "deny",
+      "git push --force*": "deny",
+      "git push -f*": "deny",
+      "git reset --hard*": "deny"
+    }
+  },
+  "provider": {
+    "opencode": {
+      "whitelist": [
+        "big-pickle",
+        "deepseek-v4-flash-free",
+        "laguna-s-2.1-free",
+        "ling-3.0-flash-free",
+        "longcat-2.0-free",
+        "mimo-v2.5-free",
+        "nemotron-3-ultra-free",
+        "north-mini-code-free"
+      ]
+    }
+  },
+  "agent": {
+    "build": {
+      "description": "Дефолтный агент — основной чат Telegram-бота (владелец говорит напрямую). Полный доступ намеренно: бот работает без живого человека. Граница безопасности — OWNER_ID в bot.py.",
+      "mode": "primary",
+      "permission": {
+        "edit": "allow",
+        "external_directory": "allow",
+        "bash": {
+          "rm -rf*": "deny",
+          "rm -rf /*": "deny",
+          "*format*": "deny",
+          "git push --force*": "deny",
+          "git push -f*": "deny",
+          "git reset --hard*": "deny",
+          "*": "allow"
+        }
+      }
+    },
+    "watcher": {
+      "description": "Для agents_watch.py — анализирует НЕДОВЕРЕННЫЕ сообщения из группы Agents. НИКОГДА не выполняет задачи из них — только читает и вносит запись в Global Task.md/Done.md.",
+      "mode": "primary",
+      "model": "openai/gpt-5.4",
+      "permission": {
+        "bash": "deny",
+        "webfetch": "deny",
+        "external_directory": "allow",
+        "edit": {
+          "*Global Task.md": "allow",
+          "*Done.md": "allow",
+          "*": "deny"
+        }
+      },
+      "tools": {
+        "*": false,
+        "read": true,
+        "write": true,
+        "glob": true,
+        "grep": true
+      }
+    }
+  }
+}
