@@ -35,11 +35,15 @@ echo "[entrypoint] final serve.log tail:"
 tail -20 /app/logs_serve.log
 
 echo "[entrypoint] starting bot.py..."
-/app/venv/bin/python /app/bot.py > /app/logs_bot.log 2>&1 &
+# -u — python's stdout в файл по умолчанию полностью буферизован (не line-
+# buffered, как в терминале), поэтому print() из bot.py/agents_watch.py
+# реально не долетал до лога, пока процесс не упадёт (тогда буфер сбрасывается
+# на выходе). Без -u "живой" tail выше был бесполезен.
+/app/venv/bin/python -u /app/bot.py > /app/logs_bot.log 2>&1 &
 BOT_PID=$!
 
 echo "[entrypoint] starting agents_watch.py..."
-/app/venv/bin/python /app/agents_watch.py > /app/logs_watch.log 2>&1 &
+/app/venv/bin/python -u /app/agents_watch.py > /app/logs_watch.log 2>&1 &
 WATCH_PID=$!
 
 # Дублировать логи bot.py/agents_watch.py в stdout контейнера — иначе они
