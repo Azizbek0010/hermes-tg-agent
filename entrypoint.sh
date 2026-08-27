@@ -12,16 +12,27 @@ export OC_PORT="${OC_PORT:-46177}"
 export OC_CWD="${OC_CWD:-/app}"
 
 echo "[entrypoint] starting opencode serve on :$OC_PORT ..."
-opencode serve --port "$OC_PORT" --hostname 127.0.0.1 > /app/logs_serve.log 2>&1 &
+# </dev/null — иначе, если opencode на первом запуске ждёт ввод с stdin
+# (какой-нибудь first-run prompt), процесс висит вечно без единой строки
+# в логе. Это и произошло при первом деплое 2026-08-27 (зависание >1 часа).
+opencode serve --port "$OC_PORT" --hostname 127.0.0.1 < /dev/null > /app/logs_serve.log 2>&1 &
 SERVE_PID=$!
 
 for i in $(seq 1 30); do
   if curl -s "http://127.0.0.1:$OC_PORT/doc" > /dev/null 2>&1; then
-    echo "[entrypoint] opencode serve is up"
+    echo "[entrypoint] opencode serve is up after ${i}0s"
+    break
+  fi
+  echo "[entrypoint] waiting for opencode serve... attempt $i/30"
+  if ! kill -0 $SERVE_PID 2>/dev/null; then
+    echo "[entrypoint] !!! opencode serve process DIED, tail of its log:"
+    tail -30 /app/logs_serve.log
     break
   fi
   sleep 2
 done
+echo "[entrypoint] final serve.log tail:"
+tail -20 /app/logs_serve.log
 
 echo "[entrypoint] starting bot.py..."
 /app/venv/bin/python /app/bot.py > /app/logs_bot.log 2>&1 &
