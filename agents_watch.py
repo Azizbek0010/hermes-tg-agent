@@ -37,6 +37,8 @@ WATCHER_SESSION = os.environ["TELEGRAM_WATCHER_SESSION"]
 AGENTS_GROUP_ID = int(os.environ["AGENTS_GROUP_ID"])
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+BOT_ID = int(BOT_TOKEN.split(":")[0])
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "").lstrip("@").lower()
 OWNER_ID = os.environ["OWNER_ID"]
 OC_PORT = int(os.environ.get("OC_PORT", "46100"))
 OC_AGENT = os.environ.get("WATCH_OC_AGENT", "watcher")
@@ -208,6 +210,28 @@ def append_task(project: str, task_text: str):
     GLOBAL_TASK.write_text(text, encoding="utf-8")
 
 
+async def is_direct_ping(event, text: str) -> bool:
+    """Детерминированная проверка "это прямое обращение к Hermes?" — модель
+    дважды подряд (проверено вживую на Render) неверно ставила
+    REPLY_IN_GROUP:нет на сообщения вроде "Hermes, ответь" вопреки явному
+    примеру в промпте. Полагаться только на LLM-классификацию для базового
+    "меня позвали?" ненадёжно, поэтому здесь — простая надёжная эвристика,
+    которая форсирует ответ независимо от вердикта модели."""
+    t = text.lower()
+    if "hermes" in t or "гермес" in t:
+        return True
+    if BOT_USERNAME and BOT_USERNAME in t:
+        return True
+    if event.message.reply_to_msg_id:
+        try:
+            replied = await event.message.get_reply_message()
+            if replied and getattr(replied, "sender_id", None) == BOT_ID:
+                return True
+        except Exception:
+            pass
+    return False
+
+
 async def handle_message(event):
     msg = event.message
     print(f"[watch] event fired: chat_id={event.chat_id} msg_id={msg.id} text={(msg.message or '')[:60]!r}", flush=True)
@@ -245,6 +269,12 @@ async def handle_message(event):
     print(f"[watch] verdict raw: {raw[:400]!r}", flush=True)
     v = parse_verdict(raw)
     print(f"[watch] parsed: silence={v['silence']} task={v['task']} reply_in_group={v['reply_in_group']}", flush=True)
+    if not v["reply_in_group"] and await is_direct_ping(event, text):
+        print("[watch] override: прямое обращение к Hermes, но модель сказала REPLY_IN_GROUP:нет — форсирую ответ", flush=True)
+        v["reply_in_group"] = True
+        v["silence"] = False
+        if not v["reply_text"]:
+            v["reply_text"] = v["summary"] or "Да, здесь. Слушаю — что нужно?"
     # ВАЖНО: SILENCE больше НЕ обрывает обработку целиком (старый баг — модель
     # иногда ставит SILENCE:да даже на прямой вопрос вопреки правилу в
     # промпте, и это глушило корректно вычисленный REPLY_IN_GROUP:да).
