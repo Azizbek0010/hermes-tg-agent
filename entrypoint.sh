@@ -46,5 +46,14 @@ echo "[entrypoint] all started: serve=$SERVE_PID bot=$BOT_PID watch=$WATCH_PID"
 
 # если любой процесс упадёт — контейнер должен упасть, Render перезапустит сам
 wait -n $SERVE_PID $BOT_PID $WATCH_PID
-echo "[entrypoint] one of the processes exited, shutting down"
+echo "[entrypoint] one of the processes exited, shutting down. Logs:"
+for p in "$SERVE_PID:serve:/app/logs_serve.log" "$BOT_PID:bot:/app/logs_bot.log" "$WATCH_PID:watch:/app/logs_watch.log"; do
+  pid="${p%%:*}"; rest="${p#*:}"; name="${rest%%:*}"; file="${rest#*:}"
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "[entrypoint] $name (pid $pid) is STILL ALIVE"
+  else
+    echo "[entrypoint] === $name (pid $pid) DIED, last 40 lines of $file ==="
+    tail -40 "$file" 2>&1
+  fi
+done
 exit 1
