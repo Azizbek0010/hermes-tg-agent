@@ -42,6 +42,13 @@ echo "[entrypoint] starting agents_watch.py..."
 /app/venv/bin/python /app/agents_watch.py > /app/logs_watch.log 2>&1 &
 WATCH_PID=$!
 
+# Дублировать логи bot.py/agents_watch.py в stdout контейнера — иначе они
+# видны через Render API только когда процесс УЖЕ упал (diagnostic tail ниже).
+# Живой разбор ("почему не отвечает, хотя процесс жив") без этого невозможен.
+touch /app/logs_bot.log /app/logs_watch.log
+( tail -n +1 -F /app/logs_bot.log 2>/dev/null | sed -u 's/^/[bot] /' ) &
+( tail -n +1 -F /app/logs_watch.log 2>/dev/null | sed -u 's/^/[watch] /' ) &
+
 echo "[entrypoint] all started: serve=$SERVE_PID bot=$BOT_PID watch=$WATCH_PID"
 
 # если любой процесс упадёт — контейнер должен упасть, Render перезапустит сам.
