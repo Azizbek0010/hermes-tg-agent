@@ -290,6 +290,13 @@ async def handle_message(event):
     if sender is None:
         print("[watch] sender is None — игнор", flush=True)
         return
+    if getattr(sender, "id", None) == BOT_ID:
+        # Собственные сообщения Hermes — не анализируем вообще (реальный
+        # случай 2026-08-28: пытался критиковать сам себя, спасло только
+        # то, что упёрся в кулдаун). Смысла в самокритике нет, только
+        # лишний вызов opencode и шаг к петле.
+        print("[watch] sender is myself (Hermes) — игнор", flush=True)
+        return
     is_bot_sender = getattr(sender, "bot", False)
     if is_bot_sender:
         print(f"[watch] sender is a bot ({getattr(sender,'username',None)}) — анализирую, но НЕ отвечаю", flush=True)
