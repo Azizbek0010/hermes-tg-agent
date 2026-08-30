@@ -127,23 +127,60 @@ def ask_opencode(text: str) -> str:
     return result
 
 
+# Telegram отклоняет сообщения длиннее 4096 символов. Развёрнутый разбор
+# легко переваливает за лимит, поэтому режем по абзацам, а не по символам.
+TG_LIMIT = 4000
+
+
+def _split_for_telegram(text: str, limit: int = TG_LIMIT) -> list:
+    if len(text) <= limit:
+        return [text]
+    chunks, cur = [], ""
+    for para in text.split("\n\n"):
+        if len(para) > limit:            # один абзац сам по себе огромный
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            for i in range(0, len(para), limit):
+                chunks.append(para[i:i + limit])
+            continue
+        candidate = f"{cur}\n\n{para}" if cur else para
+        if len(candidate) > limit:
+            chunks.append(cur)
+            cur = para
+        else:
+            cur = candidate
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
 def notify_owner(text: str):
-    requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json={"chat_id": OWNER_ID, "text": text},
-        timeout=15,
-    )
+    for chunk in _split_for_telegram(text):
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": OWNER_ID, "text": chunk},
+            timeout=15,
+        )
 
 
 def reply_in_group_as_bot(reply_to_message_id: int, text: str):
     """Ответ в группу идёт от бота Hermes (Bot API), НЕ от личного аккаунта
-    владельца через Telethon — Telethon тут только читает/анализирует."""
-    r = requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json={"chat_id": AGENTS_GROUP_ID, "text": text, "reply_to_message_id": reply_to_message_id},
-        timeout=15,
-    )
-    r.raise_for_status()
+    владельца через Telethon — Telethon тут только читает/анализирует.
+
+    Длинные разборы разбиваются на несколько сообщений: Telegram режет всё
+    длиннее 4096 символов, и без разбиения глубокий ответ просто не уходил
+    (sendMessage возвращал ошибку, ответ терялся целиком)."""
+    for i, chunk in enumerate(_split_for_telegram(text)):
+        payload = {"chat_id": AGENTS_GROUP_ID, "text": chunk}
+        if i == 0:
+            payload["reply_to_message_id"] = reply_to_message_id
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json=payload,
+            timeout=15,
+        )
+        r.raise_for_status()
 
 
 PROJECTS = ["LevelUp Academy", "Greenhouse", "Ishchi.uz", "AI Camera Pilot", "Misc"]
@@ -302,28 +339,55 @@ SUMMARY: <связное сообщение владельцу на русско
 """
 
 
+FIELD_MARKERS = ("SILENCE:", "TASK:", "TASK_TEXT:", "PROJECT:",
+                 "REPLY_IN_GROUP:", "REPLY_TEXT:", "SUMMARY:")
+
+
 def parse_verdict(raw: str) -> dict:
+    """Разбирает вердикт модели, СОХРАНЯЯ многострочные поля целиком.
+
+    Баг, найденный живым тестом 2026-08-30: старая версия читала построчно и
+    для REPLY_TEXT/SUMMARY брала только ПЕРВУЮ строку. Любой развёрнутый
+    разбор обрезался на первом абзаце — ответ уходил в группу с фразой
+    "ниже разложу по случаям" и без самого разбора. Именно это, а не промпт,
+    делало ответы Hermes короткими. Теперь текст поля копится до следующего
+    маркера поля."""
     result = {
         "silence": False, "task": False, "project": "Misc", "task_text": "",
         "reply_in_group": False, "reply_text": "", "summary": "",
     }
+    current = None          # какое многострочное поле сейчас набираем
+    buf: list = []
+
+    def flush():
+        if current and buf:
+            result[current] = "\n".join(buf).strip()
+
     for line in raw.splitlines():
-        line = line.strip()
-        if line.upper().startswith("SILENCE:"):
-            result["silence"] = "да" in line.lower()
-        elif line.upper().startswith("TASK:") and not line.upper().startswith("TASK_TEXT"):
-            result["task"] = "да" in line.lower()
-        elif line.upper().startswith("PROJECT:"):
-            val = line.split(":", 1)[1].strip()
-            result["project"] = val if val in PROJECTS else "Misc"
-        elif line.upper().startswith("TASK_TEXT:"):
-            result["task_text"] = line.split(":", 1)[1].strip()
-        elif line.upper().startswith("REPLY_IN_GROUP:"):
-            result["reply_in_group"] = "да" in line.lower()
-        elif line.upper().startswith("REPLY_TEXT:"):
-            result["reply_text"] = line.split(":", 1)[1].strip()
-        elif line.upper().startswith("SUMMARY:"):
-            result["summary"] = line.split(":", 1)[1].strip()
+        stripped = line.strip()
+        upper = stripped.upper()
+        marker = next((m for m in FIELD_MARKERS if upper.startswith(m)), None)
+        if marker:
+            flush()
+            current, buf = None, []
+            value = stripped.split(":", 1)[1].strip()
+            if marker == "SILENCE:":
+                result["silence"] = "да" in value.lower()
+            elif marker == "TASK:":
+                result["task"] = "да" in value.lower()
+            elif marker == "PROJECT:":
+                result["project"] = value if value in PROJECTS else "Misc"
+            elif marker == "REPLY_IN_GROUP:":
+                result["reply_in_group"] = "да" in value.lower()
+            else:
+                # многострочные поля: TASK_TEXT / REPLY_TEXT / SUMMARY
+                current = marker.rstrip(":").lower()
+                buf = [value] if value else []
+        elif current:
+            # строку внутри поля сохраняем как есть (в т.ч. пустую — она
+            # разделяет абзацы в развёрнутом разборе)
+            buf.append(line.rstrip())
+    flush()
     return result
 
 
