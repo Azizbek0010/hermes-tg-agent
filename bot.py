@@ -46,6 +46,49 @@ HTTP_TIMEOUT = 900  # 15 мин на тяжёлые задачи
 AGENTS_GROUP_ID = int(os.environ["AGENTS_GROUP_ID"]) if os.environ.get("AGENTS_GROUP_ID") else None
 PENDING_FILE = Path(os.environ.get("PENDING_APPROVALS_PATH", str(BASE / "pending_approvals.json")))
 
+# Куда агент кладёт созданные файлы. ВАЖНО: контейнер Render эфемерный и до
+# локального Obsidian владельца (C:\Users\user\Documents\my-brain) дотянуться
+# физически не может — проверено, переменная OBSIDIAN_VAULT там не задана.
+# Поэтому созданные файлы не «сохраняются на сервере», а ОТПРАВЛЯЮТСЯ
+# владельцу в Telegram документом: так они реально попадают к нему в руки и
+# он кладёт их в Obsidian сам.
+WORKSPACE = Path(os.environ.get("WORKSPACE_PATH", str(BASE / "workspace")))
+
+
+def send_document(chat_id: int, file_path: Path, caption: str = ""):
+    """Отправляет файл владельцу. Telegram Bot API отдаёт до 50 МБ."""
+    try:
+        with open(file_path, "rb") as fh:
+            requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
+                data={"chat_id": chat_id, "caption": caption[:1000]},
+                files={"document": (file_path.name, fh)},
+                timeout=120,
+            )
+        return True
+    except Exception as e:
+        print(f"[bot] не смог отправить файл {file_path}: {e}")
+        return False
+
+
+def collect_and_send_files(chat_id: int, work_dir: Path, caption: str) -> int:
+    """Отдаёт владельцу всё, что агент создал. Много файлов — одним zip."""
+    if not work_dir.exists():
+        return 0
+    files = [p for p in work_dir.rglob("*") if p.is_file()]
+    if not files:
+        return 0
+    if len(files) == 1:
+        send_document(chat_id, files[0], caption)
+        return 1
+    import zipfile
+    archive = work_dir.parent / f"{work_dir.name}.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in files:
+            z.write(p, p.relative_to(work_dir))
+    send_document(chat_id, archive, f"{caption} ({len(files)} файлов)")
+    return len(files)
+
 
 
 
@@ -309,7 +352,7 @@ async def on_approval_callback(cb: CallbackQuery):
     работа реально выполняется (через opencode) и результат уходит в группу
     ответом на исходную просьбу; при «Yo'q» — вежливый отказ."""
     data = cb.data or ""
-    if not (data.startswith("apr:") or data.startswith("den:")):
+    if not any(data.startswith(p) for p in ("apr:", "den:", "sav:")):
         return
     if not owner or cb.from_user.id != owner["id"]:
         await cb.answer("Только владелец может решать", show_alert=True)
@@ -352,7 +395,54 @@ async def on_approval_callback(cb: CallbackQuery):
             )
         return
 
-    # ── Разрешено ────────────────────────────────────────────────────────────
+    # ── «Task qilib saqla» — не делаем сейчас, оформляем задачу в .md ────────
+    if action == "sav":
+        req["status"] = "saved"
+        pending[req_id] = req
+        save_json(PENDING_FILE, pending)
+        await cb.answer("Сохраняю как задачу")
+        try:
+            await cb.message.edit_text(f"{cb.message.text}\n\n📝 Saqlandi — задача на потом.")
+        except Exception:
+            pass
+
+        prompt = (
+            "Оформи эту просьбу как задачу для Obsidian в формате Markdown, "
+            "по-русски. Верни ТОЛЬКО содержимое .md файла, без пояснений вокруг.\n"
+            "Структура: заголовок; кто просил и когда; что именно нужно сделать; "
+            "критерии готовности (чек-лист); ориентировочные шаги; открытые вопросы.\n\n"
+            f"Кто просил: {requester}\n"
+            f"Просьба: {request_text}"
+        )
+        try:
+            md = await ask_opencode(prompt, owner["id"])
+        except Exception as e:
+            md = f"# Задача от {requester}\n\n{request_text}\n\n(агент не смог оформить: {e})"
+
+        WORKSPACE.mkdir(parents=True, exist_ok=True)
+        safe = "".join(c for c in requester if c.isalnum() or c in "-_")[:20] or "task"
+        md_path = WORKSPACE / f"task_{time.strftime('%Y-%m-%d')}_{safe}.md"
+        md_path.write_text(md, encoding="utf-8")
+        send_document(
+            owner["id"], md_path,
+            "📝 Задача на потом — сохрани в Obsidian.\n"
+            "(Контейнер до твоего локального хранилища не дотягивается, "
+            "поэтому файл приходит сюда.)",
+        )
+        if AGENTS_GROUP_ID and group_msg_id:
+            requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json={
+                    "chat_id": AGENTS_GROUP_ID,
+                    "reply_to_message_id": group_msg_id,
+                    "text": f"{requester}, задачу принял и поставил в очередь. "
+                            f"Возьмусь позже — как дойдут руки у владельца.",
+                },
+                timeout=15,
+            )
+        return
+
+    # ── «Hozir qil» — выполняем прямо сейчас, с созданием файлов ────────────
     req["status"] = "approved"
     pending[req_id] = req
     save_json(PENDING_FILE, pending)
@@ -362,10 +452,16 @@ async def on_approval_callback(cb: CallbackQuery):
     except Exception:
         pass
 
+    work_dir = WORKSPACE / req_id
+    work_dir.mkdir(parents=True, exist_ok=True)
     prompt = (
-        "Владелец РАЗРЕШИЛ взяться за эту работу. Выполни её полноценно и "
-        "по существу, на русском языке, с конкретным результатом (код, схема, "
-        "план — что уместно), а не общими словами.\n\n"
+        "Владелец РАЗРЕШИЛ взяться за эту работу. Выполни её полноценно, "
+        "по-русски, с конкретным результатом, а не общими словами.\n\n"
+        f"ВСЕ создаваемые файлы клади в каталог: {work_dir}\n"
+        "Если результат — это код, сайт, схема или документ, ОБЯЗАТЕЛЬНО создай "
+        "реальные файлы в этом каталоге (пиши их инструментами), а не только "
+        "показывай код в ответе. В самом ответе дай краткое резюме: что сделал, "
+        "какие файлы создал и как этим пользоваться.\n\n"
         f"Кто просил: {requester}\n"
         f"Просьба: {request_text}"
     )
@@ -374,6 +470,13 @@ async def on_approval_callback(cb: CallbackQuery):
     except Exception as e:
         answer = ""
         await cb.message.answer(f"⚠️ Не смог выполнить: {e}")
+
+    n = collect_and_send_files(owner["id"], work_dir, "📦 Файлы по выполненной задаче")
+    if n:
+        await cb.message.answer(f"📦 Готово: создано файлов — {n}, отправил выше.")
+    else:
+        await cb.message.answer("ℹ️ Файлов агент не создал — результат только текстом.")
+
     if answer and AGENTS_GROUP_ID and group_msg_id:
         for i in range(0, len(answer), 4000):
             payload = {"chat_id": AGENTS_GROUP_ID, "text": answer[i:i + 4000]}

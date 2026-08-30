@@ -9,3 +9,7 @@ owner.json
 agents_watch_session.txt
 agents_watch_files/
 .env
+
+# рабочая папка агента и очередь запросов на разрешение
+workspace/
+pending_approvals.json
