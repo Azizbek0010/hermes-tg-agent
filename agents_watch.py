@@ -362,6 +362,15 @@ AI Camera Pilot). Такую работу ты НЕ начинаешь сам: �
 отвечай сразу, разрешение не нужно.
 Проверка: просят СДЕЛАТЬ вещь → да. Просят ОБЪЯСНИТЬ или ОЦЕНИТЬ → нет.)
 
+REQUESTER: <если NEEDS_APPROVAL: да — ИМЯ того, кто именно просит сделать
+работу (бери из меток [человек]/[бот] выше). Если просит сам владелец
+Азизбек — так и напиши «владелец». Пусто, если NEEDS_APPROVAL: нет>
+
+REQUEST_SUMMARY: <если NEEDS_APPROVAL: да — суть просьбы своими словами,
+1-3 предложения по-русски: что именно просят изготовить и с какими
+условиями. Не копируй посторонние реплики из чата. Пусто, если
+NEEDS_APPROVAL: нет>
+
 APPROVAL_TEXT: <если NEEDS_APPROVAL: да — короткий вопрос владельцу
 по-русски, у которого ты просишь разрешение. Пиши по-человечески и
 конкретно, например: «Разрешаешь взяться за портфолио для него?» или
@@ -459,7 +468,8 @@ SUMMARY: <связное сообщение владельцу на русско
 
 FIELD_MARKERS = ("SILENCE:", "TASK:", "TASK_TEXT:", "PROJECT:",
                  "REPLY_IN_GROUP:", "REPLY_TEXT:", "SUMMARY:",
-                 "NEEDS_APPROVAL:", "APPROVAL_TEXT:")
+                 "NEEDS_APPROVAL:", "APPROVAL_TEXT:",
+                 "REQUESTER:", "REQUEST_SUMMARY:")
 
 
 def parse_verdict(raw: str) -> dict:
@@ -475,6 +485,7 @@ def parse_verdict(raw: str) -> dict:
         "silence": False, "task": False, "project": "Misc", "task_text": "",
         "reply_in_group": False, "reply_text": "", "summary": "",
         "needs_approval": False, "approval_text": "",
+        "requester": "", "request_summary": "",
     }
     current = None          # какое многострочное поле сейчас набираем
     buf: list = []
@@ -663,9 +674,13 @@ async def handle_batch(batch):
             # В пачке говорил только владелец — он и есть тот, кто разрешает.
             print("[watch] просит сам владелец — разрешение не требуется", flush=True)
         else:
+            # Кто просит и что именно — берём у модели, а не угадываем по
+            # «последнему чужому сообщению». Реальный случай 2026-08-30: следом
+            # за просьбой прилетела ошибка постороннего бота (402 Payment
+            # Required), и она подставилась в карточку как «что просят».
             sent = request_owner_approval(
-                requester=last_nonowner_name,
-                request_text=last_nonowner_event.message.message or "",
+                requester=v["requester"] or last_nonowner_name,
+                request_text=v["request_summary"] or (last_nonowner_event.message.message or ""),
                 approval_text=v["approval_text"],
                 group_msg_id=last_nonowner_event.message.id,
             )
