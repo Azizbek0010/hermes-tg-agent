@@ -374,6 +374,20 @@ async def handle_message(event):
         notify_owner(f"⚠️ agents_watch: ошибка анализа сообщения от {sender_name}: {e}")
         return
     print(f"[watch] verdict raw: {raw[:400]!r}", flush=True)
+    if not raw.strip():
+        # Пустой вердикт = модель физически не ответила (реальный случай
+        # 2026-08-30: лимит Codex исчерпан, API вернул 429 "The usage limit
+        # has been reached"). Раньше в этом случае срабатывал fallback ниже
+        # и Hermes постил в группу заглушку "Да, здесь. Слушаю — что нужно?",
+        # то есть выглядел живым, но пустым. Честнее промолчать в группе и
+        # сказать владельцу правду, чем отписываться болванкой.
+        print("[watch] пустой вердикт — молчу в группе, уведомляю владельца", flush=True)
+        notify_owner(
+            f"⚠️ Hermes не смог ответить на сообщение от {sender_name} — модель "
+            f"вернула пустой ответ (обычно это исчерпанный лимит Codex/429). "
+            f"В группу ничего не отправлено. Подробности — в логах Render."
+        )
+        return
     v = parse_verdict(raw)
     print(f"[watch] parsed: silence={v['silence']} task={v['task']} reply_in_group={v['reply_in_group']}", flush=True)
     if not is_bot_sender and not v["reply_in_group"] and await is_direct_ping(event, text):
