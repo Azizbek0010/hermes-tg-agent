@@ -22,6 +22,7 @@ opencode (тот же сервер :46100, что уже поднят ботом
 Запуск: длительный процесс (nohup/нативный сервис), не разовый скрипт.
 """
 import asyncio
+import json
 import os
 import sys
 import time
@@ -109,7 +110,21 @@ def ask_opencode(text: str) -> str:
     data = r.json()
     parts = data.get("parts", []) if isinstance(data, dict) else []
     texts = [p.get("text", "") for p in parts if p.get("type") == "text"]
-    return "\n".join(t for t in texts if t).strip()
+    result = "\n".join(t for t in texts if t).strip()
+    if not result:
+        # Диагностика: 2026-08-30 вердикт стал приходить пустым, и вместо
+        # разбора Hermes отвечал заглушкой. Причина неизвестна — логируем
+        # фактическую структуру ответа, чтобы не гадать.
+        try:
+            shape = {
+                "top_keys": sorted(data.keys()) if isinstance(data, dict) else type(data).__name__,
+                "part_types": [p.get("type") for p in parts],
+                "raw_head": json.dumps(data, ensure_ascii=False)[:1200],
+            }
+            print(f"[watch] EMPTY VERDICT, response shape: {shape}", flush=True)
+        except Exception as e:
+            print(f"[watch] EMPTY VERDICT, failed to dump shape: {e}", flush=True)
+    return result
 
 
 def notify_owner(text: str):
