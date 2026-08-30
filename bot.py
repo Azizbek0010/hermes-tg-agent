@@ -71,6 +71,46 @@ def send_document(chat_id: int, file_path: Path, caption: str = ""):
         return False
 
 
+def post_to_group(text: str, reply_to: int = None) -> bool:
+    """Отправка в группу с проверкой ответа Telegram и запасным путём.
+
+    Реальный случай 2026-08-30: якорное сообщение (реплика чужого бота с
+    ошибкой 402) успели удалить, Telegram вернул "message to be replied not
+    found", и результат выполненной работы пропал молча — код не смотрел на
+    ответ API. Теперь при неудачной привязке шлём то же самое без reply_to,
+    а любую ошибку пишем в лог."""
+    if not (AGENTS_GROUP_ID and text):
+        return False
+    ok_all = True
+    for i in range(0, max(len(text), 1), 4000):
+        chunk = text[i:i + 4000]
+        payload = {"chat_id": AGENTS_GROUP_ID, "text": chunk}
+        if i == 0 and reply_to:
+            payload["reply_to_message_id"] = reply_to
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json=payload, timeout=20,
+            )
+            data = r.json()
+            if not data.get("ok") and "reply" in str(data.get("description", "")).lower():
+                # якорь исчез — повторяем без привязки, чтобы не потерять текст
+                print(f"[bot] reply_to={reply_to} не найден, шлю без привязки")
+                payload.pop("reply_to_message_id", None)
+                r = requests.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                    json=payload, timeout=20,
+                )
+                data = r.json()
+            if not data.get("ok"):
+                ok_all = False
+                print(f"[bot] отправка в группу не удалась: {data.get('description')}")
+        except Exception as e:
+            ok_all = False
+            print(f"[bot] отправка в группу упала: {e}")
+    return ok_all
+
+
 def collect_and_send_files(chat_id: int, work_dir: Path, caption: str) -> int:
     """Отдаёт владельцу всё, что агент создал. Много файлов — одним zip."""
     if not work_dir.exists():
@@ -381,18 +421,12 @@ async def on_approval_callback(cb: CallbackQuery):
             await cb.message.edit_text(f"{cb.message.text}\n\n❌ Otkazano — работа не начата.")
         except Exception:
             pass
-        if AGENTS_GROUP_ID and group_msg_id:
-            requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json={
-                    "chat_id": AGENTS_GROUP_ID,
-                    "reply_to_message_id": group_msg_id,
-                    "text": f"{requester}, взять эту работу сейчас не могу — "
-                            f"владелец не дал разрешения. Если нужно обсудить или "
-                            f"разобрать задачу теоретически — спрашивайте, отвечу.",
-                },
-                timeout=15,
-            )
+        post_to_group(
+            f"{requester}, взять эту работу сейчас не могу — владелец не дал "
+            f"разрешения. Если нужно обсудить или разобрать задачу "
+            f"теоретически — спрашивайте, отвечу.",
+            reply_to=group_msg_id,
+        )
         return
 
     # ── «Task qilib saqla» — не делаем сейчас, оформляем задачу в .md ────────
@@ -429,17 +463,11 @@ async def on_approval_callback(cb: CallbackQuery):
             "(Контейнер до твоего локального хранилища не дотягивается, "
             "поэтому файл приходит сюда.)",
         )
-        if AGENTS_GROUP_ID and group_msg_id:
-            requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json={
-                    "chat_id": AGENTS_GROUP_ID,
-                    "reply_to_message_id": group_msg_id,
-                    "text": f"{requester}, задачу принял и поставил в очередь. "
-                            f"Возьмусь позже — как дойдут руки у владельца.",
-                },
-                timeout=15,
-            )
+        post_to_group(
+            f"{requester}, задачу принял и поставил в очередь. "
+            f"Возьмусь позже — как дойдут руки у владельца.",
+            reply_to=group_msg_id,
+        )
         return
 
     # ── «Hozir qil» — выполняем прямо сейчас, с созданием файлов ────────────
@@ -477,15 +505,11 @@ async def on_approval_callback(cb: CallbackQuery):
     else:
         await cb.message.answer("ℹ️ Файлов агент не создал — результат только текстом.")
 
-    if answer and AGENTS_GROUP_ID and group_msg_id:
-        for i in range(0, len(answer), 4000):
-            payload = {"chat_id": AGENTS_GROUP_ID, "text": answer[i:i + 4000]}
-            if i == 0:
-                payload["reply_to_message_id"] = group_msg_id
-            requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json=payload, timeout=20,
-            )
+    if answer:
+        sent_ok = post_to_group(answer, reply_to=group_msg_id)
+        await cb.message.answer("📨 Результат отправлен в группу."
+                                if sent_ok else
+                                "⚠️ Результат в группу отправить не удалось — см. логи.")
 
 
 async def main():
