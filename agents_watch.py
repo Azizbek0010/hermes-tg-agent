@@ -587,6 +587,12 @@ async def handle_batch(batch):
     lines = []
     last_human_event = None
     any_human = False
+    # Отдельно запоминаем последнее сообщение НЕ от владельца: гейт разрешений
+    # должен смотреть на автора просьбы, а не на последнего человека в пачке.
+    # Иначе дыра: чужой просит проект, владелец в те же 30 секунд пишет что-то
+    # своё — и гейт решает «просит владелец» и выполняет работу без спроса.
+    last_nonowner_event = None
+    last_nonowner_name = "неизвестный"
     for ev in batch:
         try:
             sender = await ev.get_sender()
@@ -600,6 +606,9 @@ async def handle_batch(batch):
         if not is_bot:
             any_human = True
             last_human_event = ev
+        if str(getattr(sender, "id", "")) != str(OWNER_ID):
+            last_nonowner_event = ev
+            last_nonowner_name = name
         lines.append(f"[{'бот' if is_bot else 'человек'}] {name}: {txt[:700]}")
     if not lines:
         return
@@ -647,20 +656,15 @@ async def handle_batch(batch):
     # ГЕЙТ РАЗРЕШЕНИЯ: чужую просьбу «сделай проект» не выполняем сами —
     # спрашиваем владельца кнопками и молчим в группе до его решения.
     if v["needs_approval"]:
-        try:
-            requester = await target_event.get_sender()
-            requester_name = (getattr(requester, "first_name", None)
-                              or getattr(requester, "username", "неизвестный"))
-        except Exception:
-            requester_name = "неизвестный"
-        if str(getattr(requester, "id", "")) == str(OWNER_ID):
+        if last_nonowner_event is None:
+            # В пачке говорил только владелец — он и есть тот, кто разрешает.
             print("[watch] просит сам владелец — разрешение не требуется", flush=True)
         else:
             sent = request_owner_approval(
-                requester=requester_name,
-                request_text=target_event.message.message or "",
+                requester=last_nonowner_name,
+                request_text=last_nonowner_event.message.message or "",
                 approval_text=v["approval_text"],
-                group_msg_id=target_event.message.id,
+                group_msg_id=last_nonowner_event.message.id,
             )
             if sent:
                 # В группу НИЧЕГО не пишем до решения владельца.
