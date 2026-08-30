@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatAction
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, ChatMemberUpdated
+from aiogram.types import Message, ChatMemberUpdated, CallbackQuery
 
 BASE = Path(__file__).parent
 load_dotenv(BASE / ".env")
@@ -39,6 +39,12 @@ API = f"http://127.0.0.1:{OC_PORT}"
 OWNER_FILE = BASE / "owner.json"
 SESSIONS_FILE = BASE / "sessions.json"
 HTTP_TIMEOUT = 900  # 15 мин на тяжёлые задачи
+
+# Гейт разрешений: agents_watch.py кладёт сюда запросы «чужой просит сделать
+# работу», а нажатия кнопок обрабатываются ЗДЕСЬ — getUpdates может
+# опрашивать только один процесс, иначе TelegramConflictError.
+AGENTS_GROUP_ID = int(os.environ["AGENTS_GROUP_ID"]) if os.environ.get("AGENTS_GROUP_ID") else None
+PENDING_FILE = Path(os.environ.get("PENDING_APPROVALS_PATH", str(BASE / "pending_approvals.json")))
 
 
 
@@ -296,6 +302,89 @@ async def on_voice(message: Message):
 
 # ---------------- запуск ----------------
 
+async def on_approval_callback(cb: CallbackQuery):
+    """Владелец нажал «Ha» или «Yo'q» на запросе разрешения из группы.
+
+    Только владелец может решать: chat_id кнопки сверяется с owner. При «Ha»
+    работа реально выполняется (через opencode) и результат уходит в группу
+    ответом на исходную просьбу; при «Yo'q» — вежливый отказ."""
+    data = cb.data or ""
+    if not (data.startswith("apr:") or data.startswith("den:")):
+        return
+    if not owner or cb.from_user.id != owner["id"]:
+        await cb.answer("Только владелец может решать", show_alert=True)
+        return
+
+    action, req_id = data.split(":", 1)
+    pending = load_json(PENDING_FILE, {})
+    req = pending.get(req_id)
+    if not req:
+        await cb.answer("Запрос уже не актуален", show_alert=True)
+        return
+    if req.get("status") != "pending":
+        await cb.answer(f"Уже обработан: {req.get('status')}", show_alert=True)
+        return
+
+    requester = req.get("requester", "пользователь")
+    request_text = req.get("request_text", "")
+    group_msg_id = req.get("group_msg_id")
+
+    if action == "den":
+        req["status"] = "denied"
+        pending[req_id] = req
+        save_json(PENDING_FILE, pending)
+        await cb.answer("Отказано")
+        try:
+            await cb.message.edit_text(f"{cb.message.text}\n\n❌ Otkazano — работа не начата.")
+        except Exception:
+            pass
+        if AGENTS_GROUP_ID and group_msg_id:
+            requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json={
+                    "chat_id": AGENTS_GROUP_ID,
+                    "reply_to_message_id": group_msg_id,
+                    "text": f"{requester}, взять эту работу сейчас не могу — "
+                            f"владелец не дал разрешения. Если нужно обсудить или "
+                            f"разобрать задачу теоретически — спрашивайте, отвечу.",
+                },
+                timeout=15,
+            )
+        return
+
+    # ── Разрешено ────────────────────────────────────────────────────────────
+    req["status"] = "approved"
+    pending[req_id] = req
+    save_json(PENDING_FILE, pending)
+    await cb.answer("Разрешено — начинаю")
+    try:
+        await cb.message.edit_text(f"{cb.message.text}\n\n✅ Ruxsat berildi — приступаю.")
+    except Exception:
+        pass
+
+    prompt = (
+        "Владелец РАЗРЕШИЛ взяться за эту работу. Выполни её полноценно и "
+        "по существу, на русском языке, с конкретным результатом (код, схема, "
+        "план — что уместно), а не общими словами.\n\n"
+        f"Кто просил: {requester}\n"
+        f"Просьба: {request_text}"
+    )
+    try:
+        answer = await ask_opencode(prompt, owner["id"])
+    except Exception as e:
+        answer = ""
+        await cb.message.answer(f"⚠️ Не смог выполнить: {e}")
+    if answer and AGENTS_GROUP_ID and group_msg_id:
+        for i in range(0, len(answer), 4000):
+            payload = {"chat_id": AGENTS_GROUP_ID, "text": answer[i:i + 4000]}
+            if i == 0:
+                payload["reply_to_message_id"] = group_msg_id
+            requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json=payload, timeout=20,
+            )
+
+
 async def main():
     global owner
     # Преднастроенный владелец из .env — безопаснее паринга через чат (урок из гайда)
@@ -312,6 +401,7 @@ async def main():
     dp.message.register(cmd_status, Command("status"))
     dp.message.register(on_voice, F.voice | F.audio | F.video_note)
     dp.message.register(on_text, F.text)
+    dp.callback_query.register(on_approval_callback)
     dp.chat_member.register(_probe_any)
     dp.channel_post.register(_probe_any)
 

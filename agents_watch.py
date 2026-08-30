@@ -185,6 +185,73 @@ def reply_in_group_as_bot(reply_to_message_id: int, text: str):
 
 PROJECTS = ["LevelUp Academy", "Greenhouse", "Ishchi.uz", "AI Camera Pilot", "Misc"]
 
+# ── Запрос разрешения у владельца ────────────────────────────────────────────
+# Требование владельца 2026-08-30: если КТО-ТО ДРУГОЙ просит Hermes сделать
+# работу (проект, портфолио, правку LevelUp), Hermes НЕ начинает её сам.
+# Он пишет владельцу, что именно просят и кто просит, и ждёт нажатия
+# кнопки «Ha» / «Yo'q». Файл общий для agents_watch.py и bot.py — оба
+# процесса живут в одном контейнере. Нажатия кнопок обрабатывает bot.py,
+# потому что getUpdates может опрашивать только ОДИН процесс (второй
+# поллер даёт TelegramConflictError — уже ловили это в этой системе).
+PENDING_FILE = Path(os.environ.get("PENDING_APPROVALS_PATH", str(BASE / "pending_approvals.json")))
+
+
+def _load_pending() -> dict:
+    try:
+        return json.loads(PENDING_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_pending(data: dict):
+    try:
+        PENDING_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"[watch] не смог сохранить pending_approvals: {e}", flush=True)
+
+
+def request_owner_approval(requester: str, request_text: str, approval_text: str,
+                           group_msg_id: int) -> bool:
+    """Шлёт владельцу запрос с кнопками Ha/Yo'q. Возвращает True, если ушло."""
+    req_id = f"r{int(time.time())}{group_msg_id % 1000}"
+    pending = _load_pending()
+    pending[req_id] = {
+        "requester": requester,
+        "request_text": request_text[:1500],
+        "group_msg_id": group_msg_id,
+        "created_at": int(time.time()),
+        "status": "pending",
+    }
+    _save_pending(pending)
+
+    text = (
+        f"🔐 Запрос разрешения\n\n"
+        f"👤 Кто просит: {requester}\n\n"
+        f"📝 Что просят:\n{request_text[:900]}\n\n"
+        f"{approval_text[:900] if approval_text else 'Разрешаешь взяться за это?'}"
+    )
+    payload = {
+        "chat_id": OWNER_ID,
+        "text": text,
+        "reply_markup": {
+            "inline_keyboard": [[
+                {"text": "✅ Ha, ruxsat", "callback_data": f"apr:{req_id}"},
+                {"text": "❌ Yo'q", "callback_data": f"den:{req_id}"},
+            ]]
+        },
+    }
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json=payload, timeout=15,
+        )
+        r.raise_for_status()
+        print(f"[watch] запрос разрешения отправлен владельцу: {req_id}", flush=True)
+        return True
+    except Exception as e:
+        print(f"[watch] не смог отправить запрос разрешения: {e}", flush=True)
+        return False
+
 BATCH_PROMPT = """Ты — Hermes, полноправный участник рабочей комнаты агентов
 в Telegram (группа "Agents"). Там же работают другие AI-агенты (Abdullox
 Claude, Abdullox OpenCode, Abdullox Hermes, TG MAX) и живые люди. Все они
@@ -282,6 +349,22 @@ REPLY_TEXT: <твой ответ в группу. ЖЁСТКИЕ ТРЕБОВА�
 
 Пусто, только если REPLY_IN_GROUP: нет>
 
+NEEDS_APPROVAL: да|нет
+(да — если КТО-ТО КРОМЕ ВЛАДЕЛЬЦА (Азизбека/Кариса) просит тебя ВЫПОЛНИТЬ
+РЕАЛЬНУЮ РАБОТУ: сделать проект, сайт, портфолио, бота; написать или
+изменить код; тронуть существующий проект владельца (LevelUp Academy,
+Greenhouse, Ishchi.uz, AI Camera Pilot); задеплоить, настроить, залить
+куда-то. Такую работу ты НЕ начинаешь сам — владелец должен разрешить.
+нет — если это вопрос, объяснение, обсуждение, спор, анализ, совет, разбор
+чужого кода без его изменения — это отвечай сразу, разрешение не нужно.
+нет — если просит САМ ВЛАДЕЛЕЦ: он и есть тот, кто разрешает.)
+
+APPROVAL_TEXT: <если NEEDS_APPROVAL: да — короткий вопрос владельцу
+по-русски, у которого ты просишь разрешение. Пиши по-человечески и
+конкретно, например: «Разрешаешь взяться за портфолио для него?» или
+«Разрешаешь менять LevelUp Academy по этой просьбе?». Одна-две строки.
+Пусто, если NEEDS_APPROVAL: нет>
+
 SUMMARY: <краткая сводка владельцу по-русски: что происходило в этой пачке
 и что ты ответил. Пусто, если SILENCE: да>
 """
@@ -372,7 +455,8 @@ SUMMARY: <связное сообщение владельцу на русско
 
 
 FIELD_MARKERS = ("SILENCE:", "TASK:", "TASK_TEXT:", "PROJECT:",
-                 "REPLY_IN_GROUP:", "REPLY_TEXT:", "SUMMARY:")
+                 "REPLY_IN_GROUP:", "REPLY_TEXT:", "SUMMARY:",
+                 "NEEDS_APPROVAL:", "APPROVAL_TEXT:")
 
 
 def parse_verdict(raw: str) -> dict:
@@ -387,6 +471,7 @@ def parse_verdict(raw: str) -> dict:
     result = {
         "silence": False, "task": False, "project": "Misc", "task_text": "",
         "reply_in_group": False, "reply_text": "", "summary": "",
+        "needs_approval": False, "approval_text": "",
     }
     current = None          # какое многострочное поле сейчас набираем
     buf: list = []
@@ -411,8 +496,10 @@ def parse_verdict(raw: str) -> dict:
                 result["project"] = value if value in PROJECTS else "Misc"
             elif marker == "REPLY_IN_GROUP:":
                 result["reply_in_group"] = "да" in value.lower()
+            elif marker == "NEEDS_APPROVAL:":
+                result["needs_approval"] = "да" in value.lower()
             else:
-                # многострочные поля: TASK_TEXT / REPLY_TEXT / SUMMARY
+                # многострочные: TASK_TEXT / REPLY_TEXT / SUMMARY / APPROVAL_TEXT
                 current = marker.rstrip(":").lower()
                 buf = [value] if value else []
         elif current:
@@ -554,7 +641,31 @@ async def handle_batch(batch):
         return
 
     v = parse_verdict(raw)
-    print(f"[watch] parsed: silence={v['silence']} task={v['task']} reply_in_group={v['reply_in_group']}", flush=True)
+    print(f"[watch] parsed: silence={v['silence']} task={v['task']} "
+          f"reply_in_group={v['reply_in_group']} needs_approval={v['needs_approval']}", flush=True)
+
+    # ГЕЙТ РАЗРЕШЕНИЯ: чужую просьбу «сделай проект» не выполняем сами —
+    # спрашиваем владельца кнопками и молчим в группе до его решения.
+    if v["needs_approval"]:
+        try:
+            requester = await target_event.get_sender()
+            requester_name = (getattr(requester, "first_name", None)
+                              or getattr(requester, "username", "неизвестный"))
+        except Exception:
+            requester_name = "неизвестный"
+        if str(getattr(requester, "id", "")) == str(OWNER_ID):
+            print("[watch] просит сам владелец — разрешение не требуется", flush=True)
+        else:
+            sent = request_owner_approval(
+                requester=requester_name,
+                request_text=target_event.message.message or "",
+                approval_text=v["approval_text"],
+                group_msg_id=target_event.message.id,
+            )
+            if sent:
+                # В группу НИЧЕГО не пишем до решения владельца.
+                print("[watch] жду решения владельца, в группу не отвечаю", flush=True)
+                return
 
     if v["task"] and v["task_text"]:
         try:
