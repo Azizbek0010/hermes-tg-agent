@@ -870,6 +870,72 @@ async def _flush_pending():
         _flush_task = None
 
 
+
+# ── Утренняя сводка задач ───────────────────────────────────────────────────
+# Владелец 2026-09-05: «почему Hermes не пишет задачи в 7?». Ответ: этой
+# рассылки в коде не существовало — она была описана только в шапке
+# Global Task.md, а кода никто не писал.
+#
+# Контейнер живёт по UTC, владелец в Ташкенте (UTC+5), поэтому 7:00 местного
+# считается через смещение, а не по локальному времени процесса.
+DIGEST_HOUR_LOCAL = int(os.environ.get("DIGEST_HOUR", "7"))
+TZ_OFFSET_HOURS = int(os.environ.get("TZ_OFFSET_HOURS", "5"))
+
+
+def _seconds_until_digest() -> float:
+    """Сколько ждать до ближайших DIGEST_HOUR_LOCAL по времени владельца."""
+    now_local = time.time() + TZ_OFFSET_HOURS * 3600
+    day = int(now_local // 86400)
+    target = day * 86400 + DIGEST_HOUR_LOCAL * 3600
+    if target <= now_local:
+        target += 86400
+    return target - now_local
+
+
+def build_digest() -> str:
+    """Сводка открытых задач из Global Task.md, сгруппированная по проектам."""
+    try:
+        text = GLOBAL_TASK.read_text(encoding="utf-8")
+    except Exception as e:
+        return f"Не смог прочитать список задач: {e}"
+
+    section, found = "Без проекта", {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            section = stripped[3:].strip()
+        elif stripped.startswith("- [ ]"):
+            found.setdefault(section, []).append(stripped[5:].strip())
+
+    total = sum(len(v) for v in found.values())
+    if not total:
+        return (
+            "Доброе утро.\n\nОткрытых задач нет — список пуст.\n\n"
+            "Если задачи должны были быть, значит они потеряны: файл задач "
+            "лежит внутри контейнера и стирается при каждом передеплое."
+        )
+
+    out = [f"Доброе утро. Открытых задач: {total}", ""]
+    for project, items in found.items():
+        out.append(f"{project} ({len(items)}):")
+        out.extend(f"  • {it}" for it in items)
+        out.append("")
+    return "\n".join(out).strip()
+
+
+async def daily_digest_loop():
+    """Раз в сутки в DIGEST_HOUR_LOCAL шлёт владельцу сводку задач."""
+    while True:
+        wait = _seconds_until_digest()
+        print(f"[watch] утренняя сводка через {wait/3600:.1f} ч", flush=True)
+        await asyncio.sleep(wait)
+        try:
+            notify_owner(build_digest())
+            print("[watch] утренняя сводка отправлена", flush=True)
+        except Exception as e:
+            print(f"[watch] сводка не отправилась: {e}", flush=True)
+        await asyncio.sleep(60)
+
 async def main():
     from telethon.sessions import StringSession
     client = TelegramClient(StringSession(WATCHER_SESSION), API_ID, API_HASH)
@@ -885,7 +951,9 @@ async def main():
         if _flush_task is None or _flush_task.done():
             _flush_task = asyncio.create_task(_flush_pending())
 
-    print(f"[ok] agents_watch слушает группу {AGENTS_GROUP_ID}")
+    asyncio.create_task(daily_digest_loop())
+    print(f"[ok] agents_watch слушает группу {AGENTS_GROUP_ID}; "
+          f"сводка в {DIGEST_HOUR_LOCAL}:00 (UTC+{TZ_OFFSET_HOURS})")
     await client.run_until_disconnected()
 
 
